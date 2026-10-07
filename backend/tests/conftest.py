@@ -1,39 +1,52 @@
-from collections.abc import Iterator
-from importlib import import_module
+# เตรียมฐานข้อมูล SQLite ในหน่วยความจำให้ทุก test (ไม่ต้องมี PostgreSQL จริง)
+from datetime import date, time, timedelta
 
 import pytest
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from app.db.models import Base, Slot
+from app.db.session import get_db
+from app.main import app
 
-upgrade = import_module("app.db.migrations.001_init").upgrade
+# ผู้รับบริการที่ยืนยันตัวตนแล้ว HN 0001234
+AUTH = {"Authorization": "Bearer verified:0001234"}
 
 
 @pytest.fixture
-def database_engine() -> Iterator[Engine]:
-    """เตรียม schema SQLite ในหน่วยความจำสำหรับทดสอบ T-01."""
-
-    test_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+def db():
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    upgrade(test_engine)
-    try:
-        yield test_engine
-    finally:
-        test_engine.dispose()
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine, autoflush=False)()
+    yield session
+    session.close()
 
 
 @pytest.fixture
-def database_session(database_engine: Engine) -> Iterator[Session]:
-    """เปิด session สำหรับตรวจ schema และงาน backend ที่ใช้ fixture นี้."""
-
-    session_factory = sessionmaker(bind=database_engine)
-    with session_factory() as session:
-        yield session
+def client(db):
+    app.dependency_overrides[get_db] = lambda: db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
 
 
-def schema_tables(database_engine: Engine) -> set[str]:
-    """คืนชื่อตารางที่ migration สร้างเพื่อให้ test ตรวจ schema ได้."""
-
-    return set(inspect(database_engine).get_table_names())
+@pytest.fixture
+def make_slot(db):
+    """สร้างช่วงเวลา 1 ช่วง ค่าเริ่มต้นคือพรุ่งนี้ 09.00 น. แพ็กเกจ BASIC"""
+    def _make(start="09:00", remaining=1, capacity=None, days_from_today=1, package_code="BASIC"):
+        h, m = map(int, start.split(":"))
+        slot = Slot(
+            slot_date=date.today() + timedelta(days=days_from_today),
+            start_time=time(h, m),
+            package_code=package_code,
+            capacity=capacity if capacity is not None else max(remaining, 1),
+            remaining=remaining,
+        )
+        db.add(slot)
+        db.commit()
+        db.refresh(slot)
+        return slot
+    return _make
